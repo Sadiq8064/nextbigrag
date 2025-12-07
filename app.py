@@ -1,14 +1,19 @@
-# gfsapi.py
 """
 Full backend with:
 - Firebase Firestore user system (email, password, API keys)
 - Multi-store per user (display_name, store_id)
 - Per-API-key 1GB quota (calculated from Firestore file sizes)
 - read (boolean) to control RAG accessibility
+- citations_enabled (boolean) to control whether citations are returned
+- Per-store system_prompt (max 100 chars excluding spaces)
+- question_answer subcollection per user to log Q&A history
+- Per-store total_questions + daily_question_counts
+- Store-level analytics endpoint
+- Dashboard-level analytics endpoint with daily graph data
 - Make-Live returning only final Ask-URL string
 - Ask endpoint using /{user_id}/{store_id}?ask=...
 - Temporary upload deletion (documents never stored permanently on disk)
-- All metadata (stores, files, usage) in Firestore (NO local JSON)
+- All metadata (stores, files, usage, Q&A) in Firestore (NO local JSON)
 """
 
 import os
@@ -18,10 +23,10 @@ import re
 import uuid
 import requests
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Dict, Any
 
 import aiofiles
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body, BackgroundTasks
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
@@ -48,6 +53,11 @@ GEMINI_REST_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 # BASE_URL provided through environment variable
 BASE_URL = os.getenv("BASE_URL")
+
+# Default per-store system prompt (<=100 chars excluding spaces)
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a helpful assistant that answers only using the provided documents."
+)
 
 # ----------------------------------------
 # Firebase initialization
@@ -138,6 +148,27 @@ def clean_filename(name: str, max_len=150) -> str:
     return name or "file"
 
 
+# ---------------- System Prompt Helper ----------------
+
+def validate_system_prompt(prompt: Optional[str]) -> str:
+    """
+    Ensure system prompt is at most 100 characters excluding spaces.
+    If None/empty, return DEFAULT_SYSTEM_PROMPT.
+    """
+    if prompt is None or not prompt.strip():
+        return DEFAULT_SYSTEM_PROMPT
+
+    cleaned = prompt.strip()
+    # Count non-space characters
+    letters_only_len = len([c for c in cleaned if not c.isspace()])
+    if letters_only_len > 100:
+        raise HTTPException(
+            status_code=400,
+            detail="System prompt exceeds 100 characters (excluding spaces)."
+        )
+    return cleaned
+
+
 # ---------------- Firestore Quota Helpers ----------------
 
 def compute_api_key_usage_bytes(user_id: str, api_key: str) -> int:
@@ -211,6 +242,11 @@ class DeleteApiKeyRequest(BaseModel):
 class CreateStoreRequest(BaseModel):
     user_id: str
     display_name: str
+    system_prompt: Optional[str] = None  # optional per-store system prompt
+
+
+class UpdateSystemPromptRequest(BaseModel):
+    system_prompt: str
 
 
 # ============================================================
@@ -221,9 +257,9 @@ class CreateStoreRequest(BaseModel):
 def register_user(payload: RegisterRequest):
     existing = list(
         db.collection("users")
-        .where("email", "==", payload.email)
-        .limit(1)
-        .stream()
+            .where("email", "==", payload.email)
+            .limit(1)
+            .stream()
     )
     if existing:
         return JSONResponse({"error": "Email already registered"}, 400)
@@ -243,9 +279,9 @@ def register_user(payload: RegisterRequest):
 def user_login(payload: LoginRequest):
     docs = list(
         db.collection("users")
-        .where("email", "==", payload.email)
-        .limit(1)
-        .stream()
+            .where("email", "==", payload.email)
+            .limit(1)
+            .stream()
     )
     if not docs:
         return JSONResponse({"error": "Invalid email or password"}, 401)
@@ -339,6 +375,9 @@ def create_store(payload: CreateStoreRequest):
     suffix = uuid.uuid4().hex[:8]
     store_id = f"{clean_filename(payload.display_name)}_{suffix}"
 
+    # Validate / normalize system prompt
+    system_prompt = validate_system_prompt(payload.system_prompt)
+
     # Create Gemini File Search store
     try:
         fs_store = client.file_search_stores.create(
@@ -357,7 +396,11 @@ def create_store(payload: CreateStoreRequest):
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "user_id": user_id,
         "api_key": api_key,
-        "read": False
+        "read": False,
+        "citations_enabled": True,        # Default: send citations
+        "system_prompt": system_prompt,   # Per-store system prompt
+        "total_questions": 0,             # Total questions ever asked to this store
+        "daily_question_counts": {}       # { "YYYY-MM-DD": count }
     })
 
     return {
@@ -380,11 +423,95 @@ def toggle_read(user_id: str, store_id: str):
         raise HTTPException(404, "Store not found")
 
     meta = doc.to_dict() or {}
+    if meta.get("user_id") != user_id:
+        raise HTTPException(403, "Store does not belong to this user")
+
     current_read = bool(meta.get("read", False))
 
     store_ref.update({"read": not current_read})
 
     return {"success": True, "read": not current_read}
+
+
+# ============================================================
+# TOGGLE CITATIONS FLAG (Firestore)
+# ============================================================
+
+@app.post("/stores/{user_id}/{store_id}/toggle-citations")
+def toggle_citations(user_id: str, store_id: str):
+    store_ref = db.collection("users").document(user_id).collection("stores").document(store_id)
+    doc = store_ref.get()
+
+    if not doc.exists:
+        raise HTTPException(404, "Store not found")
+
+    meta = doc.to_dict() or {}
+    if meta.get("user_id") != user_id:
+        raise HTTPException(403, "Store does not belong to this user")
+
+    current = bool(meta.get("citations_enabled", True))
+    new_value = not current
+
+    store_ref.update({"citations_enabled": new_value})
+
+    return {"success": True, "citations_enabled": new_value}
+
+
+# ============================================================
+# SYSTEM PROMPT GET / UPDATE (Firestore)
+# ============================================================
+
+@app.get("/stores/{user_id}/{store_id}/system-prompt")
+def get_system_prompt(user_id: str, store_id: str):
+    store_ref = db.collection("users").document(user_id).collection("stores").document(store_id)
+    doc = store_ref.get()
+
+    if not doc.exists:
+        raise HTTPException(404, "Store not found")
+
+    meta = doc.to_dict() or {}
+    if meta.get("user_id") != user_id:
+        raise HTTPException(403, "Store does not belong to this user")
+
+    system_prompt = meta.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
+
+    return {"success": True, "system_prompt": system_prompt}
+
+
+@app.post("/stores/{user_id}/{store_id}/system-prompt")
+def update_system_prompt(user_id: str, store_id: str, payload: UpdateSystemPromptRequest):
+    store_ref = db.collection("users").document(user_id).collection("stores").document(store_id)
+    doc = store_ref.get()
+
+    if not doc.exists:
+        raise HTTPException(404, "Store not found")
+
+    meta = doc.to_dict() or {}
+    if meta.get("user_id") != user_id:
+        raise HTTPException(403, "Store does not belong to this user")
+
+    new_prompt = validate_system_prompt(payload.system_prompt)
+
+    store_ref.update({"system_prompt": new_prompt})
+
+    return {"success": True, "system_prompt": new_prompt}
+
+
+@app.get("/stores/{user_id}/{store_id}/citations-status")
+def get_citations_status(user_id: str, store_id: str):
+    store_ref = db.collection("users").document(user_id).collection("stores").document(store_id)
+    doc = store_ref.get()
+
+    if not doc.exists:
+        raise HTTPException(404, "Store not found")
+
+    meta = doc.to_dict() or {}
+    if meta.get("user_id") != user_id:
+        raise HTTPException(403, "Store does not belong to this user")
+
+    enabled = bool(meta.get("citations_enabled", True))
+
+    return {"success": True, "citations_enabled": enabled}
 
 
 # ============================================================
@@ -683,13 +810,14 @@ def get_usage(user_id: str):
       - API key usage (bytes used + remaining)
       - Store usage per store
       - File list with sizes
+      - Per-store question stats (total + daily)
 
     All values are derived from Firestore:
 
     users/{user_id}
         apiKeys: [ { key } ]
     users/{user_id}/stores/{store_id}
-        api_key, display_name
+        api_key, display_name, system_prompt, total_questions, daily_question_counts
     users/{user_id}/stores/{store_id}/files/{doc_id}
         size_bytes, etc.
     """
@@ -746,7 +874,11 @@ def get_usage(user_id: str):
             "document_count": len(files_list),
             "read": meta.get("read", False),
             "created_at": meta.get("created_at"),
-            "files": files_list
+            "files": files_list,
+            "citations_enabled": meta.get("citations_enabled", True),
+            "system_prompt": meta.get("system_prompt", DEFAULT_SYSTEM_PROMPT),
+            "total_questions": int(meta.get("total_questions", 0) or 0),
+            "daily_question_counts": meta.get("daily_question_counts", {})
         })
 
     return {
@@ -757,12 +889,11 @@ def get_usage(user_id: str):
     }
 
 
-
 @app.get("/users/{user_id}/stores")
 def list_stores(user_id: str):
     """
     Returns a list of all stores owned by the user.
-    
+
     Firestore path:
       users/{user_id}/stores/{store_id}
     """
@@ -782,7 +913,11 @@ def list_stores(user_id: str):
             "read": data.get("read", False),
             "created_at": data.get("created_at"),
             "api_key_used": data.get("api_key"),
-            "file_search_store_name": data.get("file_search_store_name")
+            "file_search_store_name": data.get("file_search_store_name"),
+            "citations_enabled": data.get("citations_enabled", True),
+            "system_prompt": data.get("system_prompt", DEFAULT_SYSTEM_PROMPT),
+            "total_questions": int(data.get("total_questions", 0) or 0),
+            "daily_question_counts": data.get("daily_question_counts", {})
         })
 
     return {
@@ -791,11 +926,118 @@ def list_stores(user_id: str):
         "store_count": len(stores_list),
         "stores": stores_list
     }
+
+
 # ============================================================
-# ASK ENDPOINT (FINAL FORMAT WITH CITATIONS, Firestore)
+# QUESTION / ANSWER HISTORY (Firestore)
 # ============================================================
+
+@app.get("/users/{user_id}/question-answer")
+def list_question_answer(user_id: str, store_id: Optional[str] = None):
+    """
+    List Q&A history for a user.
+    Optional filter by store_id.
+    Firestore path:
+      users/{user_id}/question_answer/{qa_id}
+    """
+    user_ref = db.collection("users").document(user_id)
+    if not user_ref.get().exists:
+        raise HTTPException(404, "User not found")
+
+    qa_ref = user_ref.collection("question_answer")
+    if store_id:
+        query = qa_ref.where("store_id", "==", store_id)
+    else:
+        query = qa_ref
+
+    items = []
+    for doc in query.stream():
+        data = doc.to_dict() or {}
+        items.append({
+            "id": doc.id,
+            "store_id": data.get("store_id"),
+            "store_display_name": data.get("store_display_name"),
+            "question": data.get("question"),
+            "answer": data.get("answer"),
+            "asked_at": data.get("asked_at"),
+            "date": data.get("date")
+        })
+
+    return {
+        "success": True,
+        "user_id": user_id,
+        "store_id": store_id,
+        "count": len(items),
+        "items": items
+    }
+
+
+# ============================================================
+# BACKGROUND TASK: LOG Q&A + UPDATE COUNTS
+# ============================================================
+
+def log_question_answer_after_response(
+    user_id: str,
+    store_id: str,
+    question: str,
+    answer: str,
+    store_display_name: str
+):
+    """
+    This runs AFTER the response is returned to the client.
+    It stores the Q&A and updates per-store counters in Firestore.
+    """
+    try:
+        user_ref = db.collection("users").document(user_id)
+        qa_ref = user_ref.collection("question_answer").document()
+
+        now_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        date_str = time.strftime("%Y-%m-%d")
+
+        # Save Q&A
+        qa_ref.set({
+            "user_id": user_id,
+            "store_id": store_id,
+            "store_display_name": store_display_name,
+            "question": question,
+            "answer": answer,
+            "asked_at": now_ts,
+            "date": date_str
+        })
+
+        # Update store counters
+        store_ref = user_ref.collection("stores").document(store_id)
+        meta_doc = store_ref.get()
+        if not meta_doc.exists:
+            return
+
+        meta = meta_doc.to_dict() or {}
+
+        total = int(meta.get("total_questions", 0) or 0) + 1
+
+        daily = meta.get("daily_question_counts", {}) or {}
+        if not isinstance(daily, dict):
+            daily = {}
+
+        current = int(daily.get(date_str, 0) or 0) + 1
+        daily[date_str] = current
+
+        store_ref.update({
+            "total_questions": total,
+            "daily_question_counts": daily
+        })
+
+    except Exception as e:
+        # Non-blocking, only log
+        print("Logging error (non-blocking):", e)
+
+
+# ============================================================
+# ASK ENDPOINT (WITH SYSTEM PROMPT, CITATIONS FLAG, Q&A LOGGING)
+# ============================================================
+
 @app.get("/{user_id}/{store_id}", response_class=JSONResponse)
-def ask(user_id: str, store_id: str, ask: str):
+def ask(user_id: str, store_id: str, ask: str, background_tasks: BackgroundTasks):
     question = ask
 
     # Fetch store metadata
@@ -815,6 +1057,8 @@ def ask(user_id: str, store_id: str, ask: str):
 
     api_key = meta["api_key"]
     fs_name = meta["file_search_store_name"]
+    citations_enabled = bool(meta.get("citations_enabled", True))
+    system_prompt = meta.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
 
     client = init_gemini_client(api_key)
 
@@ -823,11 +1067,16 @@ def ask(user_id: str, store_id: str, ask: str):
             file_search=types.FileSearch(file_search_store_names=[fs_name])
         )
 
+        # Combine store system prompt with the hard constraint
+        full_system_instruction = (
+            f"{system_prompt}\n\nAnswer ONLY using information from the documents."
+        )
+
         resp = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=question,
             config=types.GenerateContentConfig(
-                system_instruction="Answer ONLY using information from the documents.",
+                system_instruction=full_system_instruction,
                 tools=[tool],
                 temperature=0.2
             )
@@ -838,23 +1087,231 @@ def ask(user_id: str, store_id: str, ask: str):
         # ---------------- CLEAN CITATION (ONLY FIRST CHUNK) ----------------
         first_citation = None
 
-        if hasattr(resp, "candidates") and resp.candidates:
-            gm = getattr(resp.candidates[0], "grounding_metadata", None)
+        if citations_enabled:
+            if hasattr(resp, "candidates") and resp.candidates:
+                gm = getattr(resp.candidates[0], "grounding_metadata", None)
 
-            if gm and gm.grounding_chunks:
-                chunk = gm.grounding_chunks[0]  # FIRST CHUNK ONLY
-                if chunk.retrieved_context:
-                    first_citation = {
-                        "text": chunk.retrieved_context.text,
-                        "title": chunk.retrieved_context.title
-                    }
+                if gm and gm.grounding_chunks:
+                    chunk = gm.grounding_chunks[0]  # FIRST CHUNK ONLY
+                    if chunk.retrieved_context:
+                        first_citation = {
+                            "text": chunk.retrieved_context.text,
+                            "title": chunk.retrieved_context.title
+                        }
         # --------------------------------------------------------------------
 
-        return {
+        payload = {
             "success": True,
-            "answer": answer,
-            "citation": first_citation   # ONLY short clean chunk
+            "answer": answer
         }
+
+        # Only include citation key if enabled
+        if citations_enabled:
+            payload["citation"] = first_citation
+
+        # Add background logging task (non-blocking)
+        background_tasks.add_task(
+            log_question_answer_after_response,
+            user_id,
+            store_id,
+            question,
+            answer,
+            meta.get("display_name")
+        )
+
+        return payload
 
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+# ============================================================
+# STORE-LEVEL ANALYTICS
+# ============================================================
+
+@app.get("/users/{user_id}/stores/{store_id}/analytics")
+def store_analytics(user_id: str, store_id: str, limit: int = 20):
+    """
+    Store-level analytics for dashboard.
+
+    Returns:
+      - metadata (display_name, created_at, read, system_prompt, citations_enabled)
+      - total_questions
+      - daily_question_counts
+      - questions_today
+      - last N Q&A entries for this store
+    """
+    user_ref = db.collection("users").document(user_id)
+    if not user_ref.get().exists:
+        raise HTTPException(404, "User not found")
+
+    store_ref = user_ref.collection("stores").document(store_id)
+    store_doc = store_ref.get()
+    if not store_doc.exists:
+        raise HTTPException(404, "Store not found")
+
+    meta = store_doc.to_dict() or {}
+
+    if meta.get("user_id") != user_id:
+        raise HTTPException(403, "Store does not belong to this user")
+
+    today_str = time.strftime("%Y-%m-%d")
+    daily_counts = meta.get("daily_question_counts", {}) or {}
+    if not isinstance(daily_counts, dict):
+        daily_counts = {}
+
+    questions_today = int(daily_counts.get(today_str, 0) or 0)
+    total_questions = int(meta.get("total_questions", 0) or 0)
+
+    # Last N Q&A for this store (ordered by asked_at desc)
+    qa_ref = user_ref.collection("question_answer")
+    try:
+        query = (qa_ref.where("store_id", "==", store_id)
+                      .order_by("asked_at", direction=firestore.Query.DESCENDING)
+                      .limit(limit))
+    except Exception:
+        # If order_by fails (no index or field), fallback to unordered
+        query = qa_ref.where("store_id", "==", store_id).limit(limit)
+
+    items = []
+    for doc in query.stream():
+        data = doc.to_dict() or {}
+        items.append({
+            "id": doc.id,
+            "question": data.get("question"),
+            "answer": data.get("answer"),
+            "asked_at": data.get("asked_at"),
+            "date": data.get("date"),
+            "store_display_name": data.get("store_display_name"),
+        })
+
+    return {
+        "success": True,
+        "user_id": user_id,
+        "store_id": store_id,
+        "store": {
+            "display_name": meta.get("display_name"),
+            "created_at": meta.get("created_at"),
+            "read": meta.get("read", False),
+            "citations_enabled": meta.get("citations_enabled", True),
+            "system_prompt": meta.get("system_prompt", DEFAULT_SYSTEM_PROMPT),
+        },
+        "total_questions": total_questions,
+        "questions_today": questions_today,
+        "daily_question_counts": daily_counts,
+        "recent_qas": items
+    }
+
+
+# ============================================================
+# DASHBOARD-LEVEL ANALYTICS (ALL STORES + GRAPH DATA)
+# ============================================================
+
+@app.get("/users/{user_id}/dashboard-analytics")
+def dashboard_analytics(user_id: str):
+    """
+    Dashboard-level analytics:
+
+    - totals:
+        - total_stores
+        - total_questions_all_stores
+        - total_questions_today_all_stores
+    - per_store_totals:
+        [
+          {
+            store_id,
+            display_name,
+            total_questions,
+            questions_today
+          }, ...
+        ]
+    - top_store_today: store with max questions_today (or null)
+    - overall_daily_totals: { "YYYY-MM-DD": count }           # for overall line chart
+    - per_store_daily_totals: {
+          store_id: {
+              "display_name": str,
+              "daily_counts": { "YYYY-MM-DD": count }
+          },
+          ...
+      }                                                       # for multi-line chart
+    """
+    user_ref = db.collection("users").document(user_id)
+    if not user_ref.get().exists:
+        raise HTTPException(404, "User not found")
+
+    stores_ref = user_ref.collection("stores")
+
+    today_str = time.strftime("%Y-%m-%d")
+
+    total_questions_all_stores = 0
+    total_questions_today_all_stores = 0
+
+    per_store_totals: List[Dict[str, Any]] = []
+    overall_daily_totals: Dict[str, int] = {}
+    per_store_daily_totals: Dict[str, Dict[str, Any]] = {}
+
+    top_store_today = None
+    max_today = -1
+
+    for doc in stores_ref.stream():
+        meta = doc.to_dict() or {}
+        store_id = meta.get("store_id")
+        display_name = meta.get("display_name")
+
+        daily_counts = meta.get("daily_question_counts", {}) or {}
+        if not isinstance(daily_counts, dict):
+            daily_counts = {}
+
+        # Convert daily counts to ints
+        daily_int: Dict[str, int] = {}
+        for date_str, cnt in daily_counts.items():
+            try:
+                c = int(cnt or 0)
+            except Exception:
+                c = 0
+            daily_int[date_str] = c
+
+            # Aggregate into overall_daily_totals
+            overall_daily_totals[date_str] = overall_daily_totals.get(date_str, 0) + c
+
+        total_questions = int(meta.get("total_questions", 0) or 0)
+        questions_today = int(daily_int.get(today_str, 0) or 0)
+
+        total_questions_all_stores += total_questions
+        total_questions_today_all_stores += questions_today
+
+        per_store_totals.append({
+            "store_id": store_id,
+            "display_name": display_name,
+            "total_questions": total_questions,
+            "questions_today": questions_today
+        })
+
+        per_store_daily_totals[store_id] = {
+            "display_name": display_name,
+            "daily_counts": daily_int
+        }
+
+        # Track top store today
+        if questions_today > max_today:
+            max_today = questions_today
+            top_store_today = {
+                "store_id": store_id,
+                "display_name": display_name,
+                "questions_today": questions_today
+            }
+
+    return {
+        "success": True,
+        "user_id": user_id,
+        "totals": {
+            "total_stores": len(per_store_totals),
+            "total_questions_all_stores": total_questions_all_stores,
+            "total_questions_today_all_stores": total_questions_today_all_stores
+        },
+        "per_store_totals": per_store_totals,
+        "top_store_today": top_store_today,
+        # For dashboard graphs:
+        "overall_daily_totals": overall_daily_totals,
+        "per_store_daily_totals": per_store_daily_totals
+    }
