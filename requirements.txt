@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+aiofiles
+google-genai
+requests
+pydantic
+python-multipart
+firebase-admin
