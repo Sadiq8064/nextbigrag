@@ -796,16 +796,9 @@ def list_stores(user_id: str):
 # ============================================================
 @app.get("/{user_id}/{store_id}", response_class=JSONResponse)
 def ask(user_id: str, store_id: str, ask: str):
-    """
-    FINAL ASK ENDPOINT
-    GET /{user_id}/{store_id}?ask=QUESTION_TEXT
-
-    - Runs RAG only if read == true
-    - Returns answer + citations (grounding metadata)
-    """
     question = ask
 
-    # Fetch store metadata from Firestore
+    # Fetch store metadata
     store_ref = db.collection("users").document(user_id).collection("stores").document(store_id)
     store_doc = store_ref.get()
 
@@ -820,8 +813,8 @@ def ask(user_id: str, store_id: str, ask: str):
     if not meta.get("read", False):
         raise HTTPException(400, "Store is not live (read=false)")
 
-    api_key = meta.get("api_key")
-    fs_name = meta.get("file_search_store_name")
+    api_key = meta["api_key"]
+    fs_name = meta["file_search_store_name"]
 
     client = init_gemini_client(api_key)
 
@@ -842,15 +835,25 @@ def ask(user_id: str, store_id: str, ask: str):
 
         answer = getattr(resp, "text", "")
 
-        # ----- Extract citations / grounding metadata -----
-        grounding = None
-        if hasattr(resp, "candidates") and len(resp.candidates) > 0:
-            grounding = getattr(resp.candidates[0], "grounding_metadata", None)
+        # ---------------- CLEAN CITATION (ONLY FIRST CHUNK) ----------------
+        first_citation = None
+
+        if hasattr(resp, "candidates") and resp.candidates:
+            gm = getattr(resp.candidates[0], "grounding_metadata", None)
+
+            if gm and gm.grounding_chunks:
+                chunk = gm.grounding_chunks[0]  # FIRST CHUNK ONLY
+                if chunk.retrieved_context:
+                    first_citation = {
+                        "text": chunk.retrieved_context.text,
+                        "title": chunk.retrieved_context.title
+                    }
+        # --------------------------------------------------------------------
 
         return {
             "success": True,
             "answer": answer,
-            "citations": grounding
+            "citation": first_citation   # ONLY short clean chunk
         }
 
     except Exception as e:
