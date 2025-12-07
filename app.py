@@ -63,7 +63,7 @@ app = FastAPI(title="Gemini File Search RAG Backend Full System")
 
 
 def verify_gemini_key(api_key: str) -> bool:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={api_key}"
 
     body = {
         "contents": [{"parts": [{"text": "hello"}]}]
