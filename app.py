@@ -24,7 +24,7 @@ import aiofiles
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
-
+from fastapi import Body
 # Firebase
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -214,41 +214,60 @@ def user_login(payload: LoginRequest):
 # ============================================================
 
 @app.post("/users/{user_id}/api-keys/add")
-def add_api_key(user_id: str, payload: AddApiKeyRequest):
+def add_api_key(user_id: str, payload: AddApiKeyRequest = Body(...)):
     ref = db.collection("users").document(user_id)
     doc = ref.get()
+
     if not doc.exists:
         raise HTTPException(404, "User not found")
 
-    user = doc.to_dict()
-    keys = user.get("apiKeys", [])
+    user = doc.to_dict() or {}
+    keys = user.get("apiKeys")
 
-    for k in keys:
-        if k.get("key") == payload.api_key:
+    # Ensure apiKeys is a list
+    if not isinstance(keys, list):
+        keys = []
+
+    # Duplicate check
+    for item in keys:
+        if item.get("key") == payload.api_key:
             return JSONResponse({"error": "API key exists"}, 400)
 
-    keys.append({"key": payload.api_key, "createdAt": firestore.SERVER_TIMESTAMP})
+    # Add new key
+    keys.append({
+        "key": payload.api_key,
+        "createdAt": time.strftime("%Y-%m-%d %H:%M:%S")
+    })
+
     ref.update({"apiKeys": keys})
 
-    return {"success": True}
+    return {"success": True, "apiKeyCount": len(keys)}
 
 
 @app.delete("/users/{user_id}/api-keys/delete")
-def delete_api_key(user_id: str, payload: DeleteApiKeyRequest):
+def delete_api_key(user_id: str, payload: DeleteApiKeyRequest = Body(...)):
     ref = db.collection("users").document(user_id)
     doc = ref.get()
     if not doc.exists:
         raise HTTPException(404, "User not found")
 
-    user = doc.to_dict()
-    keys = user.get("apiKeys", [])
+    user = doc.to_dict() or {}
+    keys = user.get("apiKeys")
 
+    # Ensure apiKeys is a list
+    if not isinstance(keys, list):
+        keys = []
+
+    # Filter out the key
     new_keys = [k for k in keys if k.get("key") != payload.api_key]
+
     if len(new_keys) == len(keys):
         return JSONResponse({"error": "API key not found"}, 404)
 
     ref.update({"apiKeys": new_keys})
-    return {"success": True}
+
+    return {"success": True, "apiKeyCount": len(new_keys)}
+
 
 
 # ============================================================
