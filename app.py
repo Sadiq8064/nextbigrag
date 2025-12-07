@@ -188,7 +188,8 @@ def register_user(payload: RegisterRequest):
         "email": payload.email,
         "password": payload.password,
         "apiKeys": [],
-        "createdAt": firestore.SERVER_TIMESTAMP
+        "createdAt": time.strftime("%Y-%m-%d %H:%M:%S")
+
     })
 
     return {"success": True, "user_id": user_id}
