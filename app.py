@@ -61,6 +61,27 @@ app = FastAPI(title="Gemini File Search RAG Backend Full System")
 
 # ---------------- Helpers for local metadata ----------------
 
+
+def verify_gemini_key(api_key: str) -> bool:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key={api_key}"
+
+    body = {
+        "contents": [{"parts": [{"text": "hello"}]}]
+    }
+
+    try:
+        r = requests.post(url, json=body, timeout=5)
+
+        # Valid key → model returns candidates or text
+        if r.status_code == 200:
+            return True
+
+        # Invalid key
+        return False
+
+    except Exception:
+        return False
+
 def ensure_dirs():
     UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     Path(DATA_FILE).parent.mkdir(parents=True, exist_ok=True)
@@ -220,12 +241,16 @@ def add_api_key(user_id: str, payload: AddApiKeyRequest = Body(...)):
     doc = ref.get()
 
     if not doc.exists:
-        raise HTTPException(404, "User not found")
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Validate Gemini API key
+    is_valid = verify_gemini_key(payload.api_key)
+    if not is_valid:
+        return JSONResponse({"error": "Invalid Gemini API key"}, status_code=400)
 
     user = doc.to_dict() or {}
     keys = user.get("apiKeys")
 
-    # Ensure apiKeys is a list
     if not isinstance(keys, list):
         keys = []
 
@@ -234,15 +259,16 @@ def add_api_key(user_id: str, payload: AddApiKeyRequest = Body(...)):
         if item.get("key") == payload.api_key:
             return JSONResponse({"error": "API key exists"}, 400)
 
-    # Add new key
+    # Add key
     keys.append({
         "key": payload.api_key,
         "createdAt": time.strftime("%Y-%m-%d %H:%M:%S")
     })
 
-    ref.update({"apiKeys": keys})
+    ref.set({"apiKeys": keys}, merge=True)
 
     return {"success": True, "apiKeyCount": len(keys)}
+
 
 
 @app.delete("/users/{user_id}/api-keys/delete")
