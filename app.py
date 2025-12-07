@@ -2,29 +2,29 @@
 """
 Full backend with:
 - Firebase Firestore user system (email, password, API keys)
-- Multi-store per user (display_name, actual_store_name)
-- Per-API-key 1GB quota
+- Multi-store per user (display_name, store_id)
+- Per-API-key 1GB quota (calculated from Firestore file sizes)
 - read (boolean) to control RAG accessibility
 - Make-Live returning only final Ask-URL string
-- Ask endpoint using /{user_id}/{store}?ask=...
-- Temporary upload deletion (documents never stored)
+- Ask endpoint using /{user_id}/{store_id}?ask=...
+- Temporary upload deletion (documents never stored permanently on disk)
+- All metadata (stores, files, usage) in Firestore (NO local JSON)
 """
 
 import os
 import time
-import json
 import shutil
 import re
 import uuid
 import requests
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 import aiofiles
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
-from fastapi import Body
+
 # Firebase
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -38,7 +38,6 @@ except Exception:
     types = None
 
 # ---------------- CONFIG ----------------
-DATA_FILE = "/data/gemini_stores.json"
 UPLOAD_ROOT = Path("/data/uploads")
 
 MAX_FILE_BYTES = 50 * 1024 * 1024                   # 50MB per file
@@ -51,7 +50,6 @@ GEMINI_REST_BASE = "https://generativelanguage.googleapis.com/v1beta"
 BASE_URL = os.getenv("BASE_URL")
 
 # ----------------------------------------
-
 # Firebase initialization
 cred = credentials.Certificate("serviceAccountKey.json")
 firebase_admin.initialize_app(cred)
@@ -59,15 +57,26 @@ db = firestore.client()
 
 app = FastAPI(title="Gemini File Search RAG Backend Full System")
 
-# ---------------- Helpers for local metadata ----------------
+
+# ---------------- Helpers ----------------
+
+def ensure_dirs():
+    """Ensure only upload temp directory exists."""
+    UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+ensure_dirs()
 
 
 def verify_gemini_key(api_key: str) -> bool:
+    """Verify Gemini API key by doing a tiny generate_content call."""
     try:
+        if genai is None or types is None:
+            return False
+
         client = genai.Client(api_key=api_key)
 
-        # Try generating something small using the SAME model (2.5-flash)
-        resp = client.models.generate_content(
+        _ = client.models.generate_content(
             model="gemini-2.5-flash",
             contents="ping",
             config=types.GenerateContentConfig(
@@ -75,60 +84,18 @@ def verify_gemini_key(api_key: str) -> bool:
             )
         )
 
-        # If no exception → key is valid
         return True
 
-    except Exception as e:
-        # Invalid model? invalid key? quota? → treat as invalid
+    except Exception:
+        # Any failure: treat as invalid
         return False
 
-
-def ensure_dirs():
-    UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
-    Path(DATA_FILE).parent.mkdir(parents=True, exist_ok=True)
-
-def load_data():
-    if not os.path.exists(DATA_FILE):
-        return {"file_stores": {}, "current_store_name": None}
-    with open(DATA_FILE, "r") as f:
-        return json.load(f)
-
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-ensure_dirs()
-if not os.path.exists(DATA_FILE):
-    save_data({"file_stores": {}, "current_store_name": None})
-
-
-# ---------------- Request Models ----------------
-
-class RegisterRequest(BaseModel):
-    email: str
-    password: str
-
-class LoginRequest(BaseModel):
-    email: str
-    password: str
-
-class AddApiKeyRequest(BaseModel):
-    api_key: str
-
-class DeleteApiKeyRequest(BaseModel):
-    api_key: str
-
-class CreateStoreRequest(BaseModel):
-    user_id: str
-    display_name: str
-
-
-# ---------------- Gemini Helpers ----------------
 
 def init_gemini_client(api_key: str):
     if genai is None:
         raise RuntimeError("google-genai SDK missing")
     return genai.Client(api_key=api_key)
+
 
 def wait_for_operation(client, operation):
     op = operation
@@ -144,7 +111,9 @@ def wait_for_operation(client, operation):
 
     return op
 
+
 def rest_list_documents_for_store(store_name: str, api_key: str):
+    """Fallback: list documents using REST if SDK doesn't give resource name."""
     url = f"{GEMINI_REST_BASE}/{store_name}/documents"
     try:
         resp = requests.get(url, params={"key": api_key}, timeout=15)
@@ -152,6 +121,7 @@ def rest_list_documents_for_store(store_name: str, api_key: str):
         return resp.json().get("documents", [])
     except Exception:
         return []
+
 
 # ---------------- Filename Sanitization ----------------
 
@@ -167,18 +137,38 @@ def clean_filename(name: str, max_len=150) -> str:
         name = name[:max_len]
     return name or "file"
 
-# ---------------- Quota Helper ----------------
 
-def compute_api_key_usage_bytes(user_id: str, api_key: str):
-    data = load_data()
+# ---------------- Firestore Quota Helpers ----------------
+
+def compute_api_key_usage_bytes(user_id: str, api_key: str) -> int:
+    """
+    Compute total bytes used for a given (user_id, api_key) pair,
+    based ONLY on Firestore metadata:
+
+    users/{user_id}/stores/{store_id}
+        api_key == api_key
+        users/{user_id}/stores/{store_id}/files/{doc_id}
+            size_bytes
+    """
     total = 0
-    for store in data["file_stores"].values():
-        if store.get("user_id") == user_id and store.get("api_key") == api_key:
-            for f in store.get("files", []):
-                total += int(f.get("size_bytes", 0))
+    stores_ref = db.collection("users").document(user_id).collection("stores")
+    # Only stores that use this api_key
+    store_docs = stores_ref.where("api_key", "==", api_key).stream()
+
+    for store_doc in store_docs:
+        files_ref = store_doc.reference.collection("files")
+        for file_doc in files_ref.stream():
+            data = file_doc.to_dict() or {}
+            size = int(data.get("size_bytes", 0) or 0)
+            total += size
+
     return total
 
+
 def pick_api_key_for_new_store(user_id: str) -> str:
+    """
+    Pick an API key (among user's apiKeys) that has remaining quota < 1GB.
+    """
     doc = db.collection("users").document(user_id).get()
     if not doc.exists:
         raise HTTPException(status_code=404, detail="User not found")
@@ -189,10 +179,38 @@ def pick_api_key_for_new_store(user_id: str) -> str:
 
     for entry in api_keys:
         key = entry.get("key")
-        if compute_api_key_usage_bytes(user_id, key) < MAX_TOTAL_BYTES_PER_API_KEY:
+        used = compute_api_key_usage_bytes(user_id, key)
+        if used < MAX_TOTAL_BYTES_PER_API_KEY:
             return key
 
     raise HTTPException(status_code=400, detail="All API keys reached 1GB limit.")
+
+
+# ============================================================
+# Request Models
+# ============================================================
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class AddApiKeyRequest(BaseModel):
+    api_key: str
+
+
+class DeleteApiKeyRequest(BaseModel):
+    api_key: str
+
+
+class CreateStoreRequest(BaseModel):
+    user_id: str
+    display_name: str
 
 
 # ============================================================
@@ -201,7 +219,12 @@ def pick_api_key_for_new_store(user_id: str) -> str:
 
 @app.post("/users/register")
 def register_user(payload: RegisterRequest):
-    existing = list(db.collection("users").where("email", "==", payload.email).limit(1).stream())
+    existing = list(
+        db.collection("users")
+        .where("email", "==", payload.email)
+        .limit(1)
+        .stream()
+    )
     if existing:
         return JSONResponse({"error": "Email already registered"}, 400)
 
@@ -211,7 +234,6 @@ def register_user(payload: RegisterRequest):
         "password": payload.password,
         "apiKeys": [],
         "createdAt": time.strftime("%Y-%m-%d %H:%M:%S")
-
     })
 
     return {"success": True, "user_id": user_id}
@@ -219,14 +241,17 @@ def register_user(payload: RegisterRequest):
 
 @app.post("/users/login")
 def user_login(payload: LoginRequest):
-    docs = list(db.collection("users")
-                .where("email", "==", payload.email)
-                .limit(1).stream())
+    docs = list(
+        db.collection("users")
+        .where("email", "==", payload.email)
+        .limit(1)
+        .stream()
+    )
     if not docs:
         return JSONResponse({"error": "Invalid email or password"}, 401)
 
-    doc = docs[0].to_dict()
-    if doc.get("password") != payload.password:
+    doc_data = docs[0].to_dict()
+    if doc_data.get("password") != payload.password:
         return JSONResponse({"error": "Invalid email or password"}, 401)
 
     return {"success": True, "user_id": docs[0].id}
@@ -271,7 +296,6 @@ def add_api_key(user_id: str, payload: AddApiKeyRequest = Body(...)):
     return {"success": True, "apiKeyCount": len(keys)}
 
 
-
 @app.delete("/users/{user_id}/api-keys/delete")
 def delete_api_key(user_id: str, payload: DeleteApiKeyRequest = Body(...)):
     ref = db.collection("users").document(user_id)
@@ -282,11 +306,9 @@ def delete_api_key(user_id: str, payload: DeleteApiKeyRequest = Body(...)):
     user = doc.to_dict() or {}
     keys = user.get("apiKeys")
 
-    # Ensure apiKeys is a list
     if not isinstance(keys, list):
         keys = []
 
-    # Filter out the key
     new_keys = [k for k in keys if k.get("key") != payload.api_key]
 
     if len(new_keys) == len(keys):
@@ -297,21 +319,27 @@ def delete_api_key(user_id: str, payload: DeleteApiKeyRequest = Body(...)):
     return {"success": True, "apiKeyCount": len(new_keys)}
 
 
-
 # ============================================================
-# STORE CREATE
+# STORE CREATE (Firestore)
 # ============================================================
 
 @app.post("/stores/create")
 def create_store(payload: CreateStoreRequest):
+    """
+    Create a new File Search store for a user.
+
+    Firestore path:
+      users/{user_id}/stores/{store_id}
+    """
     user_id = payload.user_id
 
     api_key = pick_api_key_for_new_store(user_id)
     client = init_gemini_client(api_key)
 
     suffix = uuid.uuid4().hex[:8]
-    actual_store = f"{clean_filename(payload.display_name)}_{suffix}"
+    store_id = f"{clean_filename(payload.display_name)}_{suffix}"
 
+    # Create Gemini File Search store
     try:
         fs_store = client.file_search_stores.create(
             config={"display_name": payload.display_name}
@@ -320,63 +348,60 @@ def create_store(payload: CreateStoreRequest):
     except Exception as e:
         raise HTTPException(500, f"Gemini store create failed: {e}")
 
-    data = load_data()
-    data["file_stores"][actual_store] = {
-        "store_name": actual_store,
+    # Save store metadata in Firestore
+    store_ref = db.collection("users").document(user_id).collection("stores").document(store_id)
+    store_ref.set({
+        "store_id": store_id,
         "display_name": payload.display_name,
         "file_search_store_name": fs_name,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "files": [],
         "user_id": user_id,
         "api_key": api_key,
         "read": False
-    }
-
-    save_data(data)
+    })
 
     return {
         "success": True,
-        "store_actual": actual_store,
+        "store_id": store_id,
         "display_name": payload.display_name
     }
 
 
 # ============================================================
-# TOGGLE READ FLAG
+# TOGGLE READ FLAG (Firestore)
 # ============================================================
 
-@app.post("/stores/{user_id}/{store_name}/toggle-read")
-def toggle_read(user_id: str, store_name: str):
-    data = load_data()
+@app.post("/stores/{user_id}/{store_id}/toggle-read")
+def toggle_read(user_id: str, store_id: str):
+    store_ref = db.collection("users").document(user_id).collection("stores").document(store_id)
+    doc = store_ref.get()
 
-    if store_name not in data["file_stores"]:
+    if not doc.exists:
         raise HTTPException(404, "Store not found")
 
-    meta = data["file_stores"][store_name]
-    if meta["user_id"] != user_id:
-        raise HTTPException(403, "Not your store")
+    meta = doc.to_dict() or {}
+    current_read = bool(meta.get("read", False))
 
-    meta["read"] = not bool(meta.get("read", False))
-    data["file_stores"][store_name] = meta
-    save_data(data)
+    store_ref.update({"read": not current_read})
 
-    return {"success": True, "read": meta["read"]}
+    return {"success": True, "read": not current_read}
 
 
 # ============================================================
-# MAKE-LIVE → RETURNS ONLY FINAL URL STRING
+# MAKE-LIVE → RETURNS ONLY FINAL URL STRING (Firestore)
 # ============================================================
 
-@app.get("/stores/{user_id}/{store_name}/make-live", response_class=PlainTextResponse)
-def make_live(user_id: str, store_name: str):
-    data = load_data()
+@app.get("/stores/{user_id}/{store_id}/make-live", response_class=PlainTextResponse)
+def make_live(user_id: str, store_id: str):
+    store_ref = db.collection("users").document(user_id).collection("stores").document(store_id)
+    doc = store_ref.get()
 
-    if store_name not in data["file_stores"]:
+    if not doc.exists:
         raise HTTPException(404, "Store not found")
 
-    meta = data["file_stores"][store_name]
+    meta = doc.to_dict() or {}
 
-    if meta["user_id"] != user_id:
+    if meta.get("user_id") != user_id:
         raise HTTPException(403, "Store does not belong to this user")
 
     if not meta.get("read", False):
@@ -386,40 +411,41 @@ def make_live(user_id: str, store_name: str):
         raise HTTPException(500, "BASE_URL not set in environment")
 
     # REQUIRED FORMAT:
-    # https://BASE_URL/{user_id}/{store_name}?ask={question}
-    final_url = f"{BASE_URL}/{user_id}/{store_name}?ask={{question}}"
+    # https://BASE_URL/{user_id}/{store_id}?ask={question}
+    final_url = f"{BASE_URL}/{user_id}/{store_id}?ask={{question}}"
 
     # Return EXACT plain text URL
     return final_url
 
 
 # ============================================================
-# UPLOAD DOCUMENTS
+# UPLOAD DOCUMENTS (Firestore, temp-only disk)
 # ============================================================
 
-@app.post("/stores/{user_id}/{store_name}/upload")
+@app.post("/stores/{user_id}/{store_id}/upload")
 async def upload_docs(
     user_id: str,
-    store_name: str,
+    store_id: str,
     limit: bool = Form(True),
     files: List[UploadFile] = File(...)
 ):
-    data = load_data()
+    store_ref = db.collection("users").document(user_id).collection("stores").document(store_id)
+    store_doc = store_ref.get()
 
-    if store_name not in data["file_stores"]:
+    if not store_doc.exists:
         raise HTTPException(404, "Store not found")
 
-    meta = data["file_stores"][store_name]
+    meta = store_doc.to_dict() or {}
 
-    if meta["user_id"] != user_id:
+    if meta.get("user_id") != user_id:
         raise HTTPException(403, "Not your store")
 
-    fs_name = meta["file_search_store_name"]
-    api_key = meta["api_key"]
+    fs_name = meta.get("file_search_store_name")
+    api_key = meta.get("api_key")
 
     client = init_gemini_client(api_key)
 
-    temp_folder = UPLOAD_ROOT / store_name
+    temp_folder = UPLOAD_ROOT / store_id
     temp_folder.mkdir(parents=True, exist_ok=True)
 
     results = []
@@ -441,7 +467,8 @@ async def upload_docs(
                     size += len(chunk)
                     if limit and size > MAX_FILE_BYTES:
                         await out.close()
-                        os.remove(temp_path)
+                        if temp_path.exists():
+                            os.remove(temp_path)
                         results.append({
                             "filename": filename,
                             "uploaded": False,
@@ -453,8 +480,14 @@ async def upload_docs(
             results.append({"filename": filename, "uploaded": False, "reason": str(e)})
             continue
 
+        # If size loop broke due to limit, skip further logic
+        if size > MAX_FILE_BYTES and limit:
+            continue
+
+        # Check 1GB quota
         if size + current_usage > MAX_TOTAL_BYTES_PER_API_KEY:
-            os.remove(temp_path)
+            if temp_path.exists():
+                os.remove(temp_path)
             results.append({
                 "filename": filename,
                 "uploaded": False,
@@ -476,7 +509,7 @@ async def upload_docs(
 
             try:
                 document_resource = op.response.file_search_document.name
-            except:
+            except Exception:
                 document_resource = None
 
             if not document_resource:
@@ -495,19 +528,24 @@ async def upload_docs(
                 "indexed": False,
                 "error": str(e)
             })
-            os.remove(temp_path)
+            if temp_path.exists():
+                os.remove(temp_path)
             continue
 
-        # delete temp
-        os.remove(temp_path)
+        # delete temp after successful upload
+        if temp_path.exists():
+            os.remove(temp_path)
 
-        meta["files"].append({
-            "display_name": filename,
-            "size_bytes": size,
-            "uploaded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "document_resource": document_resource,
-            "document_id": document_id
-        })
+        # Save file metadata in Firestore
+        if document_id:
+            file_ref = store_ref.collection("files").document(document_id)
+            file_ref.set({
+                "document_id": document_id,
+                "display_name": filename,
+                "size_bytes": size,
+                "uploaded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "document_resource": document_resource
+            })
 
         current_usage += size
         results.append({
@@ -517,117 +555,125 @@ async def upload_docs(
             "document_id": document_id
         })
 
-    data["file_stores"][store_name] = meta
-    save_data(data)
-
     return {"success": True, "results": results}
 
 
 # ============================================================
-# DELETE DOCUMENT
+# DELETE DOCUMENT (Firestore)
 # ============================================================
 
-@app.delete("/stores/{user_id}/{store_name}/documents/{doc_id}")
-def delete_doc(user_id: str, store_name: str, doc_id: str):
-    data = load_data()
-    if store_name not in data["file_stores"]:
+@app.delete("/stores/{user_id}/{store_id}/documents/{doc_id}")
+def delete_doc(user_id: str, store_id: str, doc_id: str):
+    store_ref = db.collection("users").document(user_id).collection("stores").document(store_id)
+    store_doc = store_ref.get()
+
+    if not store_doc.exists:
         raise HTTPException(404, "Store not found")
 
-    meta = data["file_stores"][store_name]
-    if meta["user_id"] != user_id:
+    meta = store_doc.to_dict() or {}
+    if meta.get("user_id") != user_id:
         raise HTTPException(403, "Not your store")
 
-    fs_name = meta["file_search_store_name"]
-    api_key = meta["api_key"]
+    fs_name = meta.get("file_search_store_name")
+    api_key = meta.get("api_key")
 
+    # Delete from Gemini
     url = f"{GEMINI_REST_BASE}/{fs_name}/documents/{doc_id}"
     resp = requests.delete(url, params={"force": "true", "key": api_key})
 
     if resp.status_code not in (200, 204):
         return JSONResponse({"error": resp.text}, resp.status_code)
 
-    meta["files"] = [x for x in meta["files"] if x.get("document_id") != doc_id]
-    data["file_stores"][store_name] = meta
-    save_data(data)
+    # Delete file metadata from Firestore
+    store_ref.collection("files").document(doc_id).delete()
 
     return {"success": True}
 
 
 # ============================================================
-# DELETE STORE
+# DELETE STORE (Firestore)
 # ============================================================
 
-@app.delete("/stores/{user_id}/{store_name}")
-def delete_store(user_id: str, store_name: str):
-    data = load_data()
-    if store_name not in data["file_stores"]:
+@app.delete("/stores/{user_id}/{store_id}")
+def delete_store(user_id: str, store_id: str):
+    store_ref = db.collection("users").document(user_id).collection("stores").document(store_id)
+    store_doc = store_ref.get()
+
+    if not store_doc.exists:
         raise HTTPException(404, "Store not found")
 
-    meta = data["file_stores"][store_name]
-
-    if meta["user_id"] != user_id:
+    meta = store_doc.to_dict() or {}
+    if meta.get("user_id") != user_id:
         raise HTTPException(403, "Not your store")
 
-    fs_name = meta["file_search_store_name"]
-    api_key = meta["api_key"]
+    fs_name = meta.get("file_search_store_name")
+    api_key = meta.get("api_key")
 
+    # Delete Gemini store
     try:
         client = init_gemini_client(api_key)
         client.file_search_stores.delete(name=fs_name, config={"force": True})
-    except:
+    except Exception:
         pass
 
-    # delete temp
-    folder = UPLOAD_ROOT / store_name
+    # Delete all file metadata
+    files_ref = store_ref.collection("files")
+    for fdoc in files_ref.stream():
+        fdoc.reference.delete()
+
+    # Delete store document
+    store_ref.delete()
+
+    # delete temp upload folder for this store, if any
+    folder = UPLOAD_ROOT / store_id
     if folder.exists():
         shutil.rmtree(folder)
 
-    del data["file_stores"][store_name]
-    save_data(data)
-
     return {"success": True}
 
+
 # ============================================================
-# LIST ALL DOCUMENTS IN A STORE
+# LIST ALL DOCUMENTS IN A STORE (Firestore)
 # ============================================================
 
-@app.get("/stores/{user_id}/{store_name}/documents")
-def list_documents(user_id: str, store_name: str):
+@app.get("/stores/{user_id}/{store_id}/documents")
+def list_documents(user_id: str, store_id: str):
     """
     List all documents inside a store for that user.
-    Uses ONLY local metadata (documents are NOT stored).
+    Uses ONLY Firestore metadata (documents are NOT stored locally).
     """
-    data = load_data()
+    store_ref = db.collection("users").document(user_id).collection("stores").document(store_id)
+    store_doc = store_ref.get()
 
-    if store_name not in data["file_stores"]:
+    if not store_doc.exists:
         raise HTTPException(status_code=404, detail="Store not found")
 
-    meta = data["file_stores"][store_name]
+    meta = store_doc.to_dict() or {}
 
     if meta.get("user_id") != user_id:
         raise HTTPException(status_code=403, detail="Store does not belong to this user")
 
-    documents = meta.get("files", [])
-
-    # Clean response: only useful fields
     docs_clean = []
-    for doc in documents:
+    for fdoc in store_ref.collection("files").stream():
+        data = fdoc.to_dict() or {}
         docs_clean.append({
-            "document_id": doc.get("document_id"),
-            "display_name": doc.get("display_name"),
-            "size_bytes": doc.get("size_bytes"),
-            "uploaded_at": doc.get("uploaded_at"),
-            "gemini_indexed": doc.get("gemini_indexed", True)
+            "document_id": data.get("document_id"),
+            "display_name": data.get("display_name"),
+            "size_bytes": data.get("size_bytes"),
+            "uploaded_at": data.get("uploaded_at"),
+            "gemini_indexed": True  # if it's here, we assume it's indexed
         })
 
     return {
         "success": True,
         "user_id": user_id,
-        "store": store_name,
+        "store": store_id,
         "documents": docs_clean
     }
+
+
 # ============================================================
-# USER USAGE ANALYTICS (API KEYS + STORES + DOCUMENTS)
+# USER USAGE ANALYTICS (API KEYS + STORES + DOCUMENTS) - Firestore
 # ============================================================
 
 @app.get("/users/{user_id}/usage")
@@ -637,15 +683,22 @@ def get_usage(user_id: str):
       - API key usage (bytes used + remaining)
       - Store usage per store
       - File list with sizes
-    """
-    data = load_data()
 
+    All values are derived from Firestore:
+
+    users/{user_id}
+        apiKeys: [ { key } ]
+    users/{user_id}/stores/{store_id}
+        api_key, display_name
+    users/{user_id}/stores/{store_id}/files/{doc_id}
+        size_bytes, etc.
+    """
     # Get user data
     user_doc = db.collection("users").document(user_id).get()
     if not user_doc.exists:
         raise HTTPException(404, "User not found")
 
-    user = user_doc.to_dict()
+    user = user_doc.to_dict() or {}
     api_keys = user.get("apiKeys", [])
 
     # ---------- BUILD API KEY USAGE ----------
@@ -658,32 +711,42 @@ def get_usage(user_id: str):
         key_usage.append({
             "api_key": key,
             "used_bytes": used,
-            "remaining_bytes": remaining
+            "remaining_bytes": max(0, remaining)
         })
 
     # ---------- BUILD STORE USAGE ----------
     store_usage = []
-    for store_name, meta in data["file_stores"].items():
+    stores_ref = db.collection("users").document(user_id).collection("stores")
+    for store_doc in stores_ref.stream():
+        meta = store_doc.to_dict() or {}
+
         if meta.get("user_id") != user_id:
             continue
 
-        total_size = sum([f.get("size_bytes", 0) for f in meta.get("files", [])])
+        files_ref = store_doc.reference.collection("files")
+        files_list = []
+        total_size = 0
+        for fdoc in files_ref.stream():
+            fdata = fdoc.to_dict() or {}
+            s = int(fdata.get("size_bytes", 0) or 0)
+            total_size += s
+
+            files_list.append({
+                "document_id": fdata.get("document_id"),
+                "display_name": fdata.get("display_name"),
+                "size_bytes": s,
+                "uploaded_at": fdata.get("uploaded_at")
+            })
 
         store_usage.append({
-            "store_name": store_name,
+            "store_id": meta.get("store_id"),
             "display_name": meta.get("display_name"),
             "api_key_used": meta.get("api_key"),
             "total_store_bytes": total_size,
-            "document_count": len(meta.get("files", [])),
-            "files": [
-                {
-                    "document_id": f.get("document_id"),
-                    "display_name": f.get("display_name"),
-                    "size_bytes": f.get("size_bytes"),
-                    "uploaded_at": f.get("uploaded_at")
-                }
-                for f in meta.get("files", [])
-            ]
+            "document_count": len(files_list),
+            "read": meta.get("read", False),
+            "created_at": meta.get("created_at"),
+            "files": files_list
         })
 
     return {
@@ -694,35 +757,71 @@ def get_usage(user_id: str):
     }
 
 
-# ============================================================
-# ASK ENDPOINT (NEW FINAL FORMAT WITH CITATIONS)
-# ============================================================
 
-@app.get("/{user_id}/{store}", response_class=JSONResponse)
-def ask(user_id: str, store: str, ask: str):
+@app.get("/users/{user_id}/stores")
+def list_stores(user_id: str):
+    """
+    Returns a list of all stores owned by the user.
+    
+    Firestore path:
+      users/{user_id}/stores/{store_id}
+    """
+    # Check user exists
+    user_ref = db.collection("users").document(user_id)
+    if not user_ref.get().exists:
+        raise HTTPException(404, "User not found")
+
+    stores_ref = user_ref.collection("stores")
+
+    stores_list = []
+    for doc in stores_ref.stream():
+        data = doc.to_dict() or {}
+        stores_list.append({
+            "store_id": data.get("store_id"),
+            "display_name": data.get("display_name"),
+            "read": data.get("read", False),
+            "created_at": data.get("created_at"),
+            "api_key_used": data.get("api_key"),
+            "file_search_store_name": data.get("file_search_store_name")
+        })
+
+    return {
+        "success": True,
+        "user_id": user_id,
+        "store_count": len(stores_list),
+        "stores": stores_list
+    }
+# ============================================================
+# ASK ENDPOINT (FINAL FORMAT WITH CITATIONS, Firestore)
+# ============================================================
+@app.get("/{user_id}/{store_id}", response_class=JSONResponse)
+def ask(user_id: str, store_id: str, ask: str):
     """
     FINAL ASK ENDPOINT
-    GET /{user_id}/{store}?ask=QUESTION_TEXT
+    GET /{user_id}/{store_id}?ask=QUESTION_TEXT
 
     - Runs RAG only if read == true
     - Returns answer + citations (grounding metadata)
     """
     question = ask
-    data = load_data()
 
-    if store not in data["file_stores"]:
+    # Fetch store metadata from Firestore
+    store_ref = db.collection("users").document(user_id).collection("stores").document(store_id)
+    store_doc = store_ref.get()
+
+    if not store_doc.exists:
         raise HTTPException(404, "Store not found")
 
-    meta = data["file_stores"][store]
+    meta = store_doc.to_dict() or {}
 
-    if meta["user_id"] != user_id:
+    if meta.get("user_id") != user_id:
         raise HTTPException(403, "Not your store")
 
     if not meta.get("read", False):
         raise HTTPException(400, "Store is not live (read=false)")
 
-    api_key = meta["api_key"]
-    fs_name = meta["file_search_store_name"]
+    api_key = meta.get("api_key")
+    fs_name = meta.get("file_search_store_name")
 
     client = init_gemini_client(api_key)
 
