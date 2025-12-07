@@ -63,24 +63,25 @@ app = FastAPI(title="Gemini File Search RAG Backend Full System")
 
 
 def verify_gemini_key(api_key: str) -> bool:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={api_key}"
-
-    body = {
-        "contents": [{"parts": [{"text": "hello"}]}]
-    }
-
     try:
-        r = requests.post(url, json=body, timeout=5)
+        client = genai.Client(api_key=api_key)
 
-        # Valid key → model returns candidates or text
-        if r.status_code == 200:
-            return True
+        # Try generating something small using the SAME model (2.5-flash)
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents="ping",
+            config=types.GenerateContentConfig(
+                temperature=0.0
+            )
+        )
 
-        # Invalid key
+        # If no exception → key is valid
+        return True
+
+    except Exception as e:
+        # Invalid model? invalid key? quota? → treat as invalid
         return False
 
-    except Exception:
-        return False
 
 def ensure_dirs():
     UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
